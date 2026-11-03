@@ -344,3 +344,230 @@ impl Card {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::notes::Note;
+    use crate::revlog::RevlogEntry;
+    use crate::revlog::RevlogId;
+    use crate::revlog::RevlogReviewKind;
+    use crate::scheduler::fsrs::memory_state::get_decay_from_params;
+    use crate::search::SortMode;
+
+    fn collection_with_review_card() -> Result<(Collection, CardId)> {
+        let mut col = Collection::new();
+        let notetype = col.get_notetype_by_name("Basic")?.unwrap();
+        let mut note = Note::new(&notetype);
+        col.add_note(&mut note, DeckId(1))?;
+
+        let card_id = col.search_cards(note.id, SortMode::NoOrder)?[0];
+        let mut card = col.storage.get_card(card_id)?.unwrap();
+        card.ctype = CardType::Review;
+        card.queue = CardQueue::Review;
+        card.due = 10;
+        card.interval = 10;
+        card.ease_factor = 2500;
+        col.storage.update_card(&card)?;
+
+        Ok((col, card_id))
+    }
+
+    fn simulate_request() -> SimulateFsrsReviewRequest {
+        SimulateFsrsReviewRequest {
+            historical_retention: 0.9,
+            ..Default::default()
+        }
+    }
+
+    fn memory_state() -> FsrsMemoryState {
+        FsrsMemoryState {
+            difficulty: 5.0,
+            stability: 10.0,
+        }
+    }
+
+    fn card(queue: CardQueue, due: i32, interval: u32) -> Card {
+        Card {
+            ctype: CardType::Review,
+            queue,
+            due,
+            interval,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn review_card_future_last_date_is_clamped_to_zero() {
+        let converted = Card::convert(card(CardQueue::Review, 30, 7), 10, memory_state()).unwrap();
+
+        assert_eq!(converted.due, 20.0);
+        assert_eq!(converted.interval, 7.0);
+        assert_eq!(converted.last_date, 0.0);
+    }
+
+    #[test]
+    fn review_card_keeps_past_last_date() {
+        let converted = Card::convert(card(CardQueue::Review, 15, 7), 10, memory_state()).unwrap();
+
+        assert_eq!(converted.due, 5.0);
+        assert_eq!(converted.last_date, -2.0);
+    }
+
+    #[test]
+    fn day_learning_card_uses_relative_due_and_interval() {
+        let converted =
+            Card::convert(card(CardQueue::DayLearn, 12, 4), 10, memory_state()).unwrap();
+
+        assert_eq!(converted.due, 2.0);
+        assert_eq!(converted.interval, 4.0);
+        assert_eq!(converted.last_date, -2.0);
+    }
+
+    #[test]
+    fn learning_and_buried_cards_have_zero_due_and_last_date() {
+        for queue in [
+            CardQueue::Learn,
+            CardQueue::SchedBuried,
+            CardQueue::UserBuried,
+        ] {
+            let converted = Card::convert(card(queue, 30, 7), 10, memory_state()).unwrap();
+
+            assert_eq!(converted.due, 0.0, "queue: {queue:?}");
+            assert_eq!(converted.last_date, 0.0, "queue: {queue:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_queues_are_not_converted() {
+        for queue in [
+            CardQueue::New,
+            CardQueue::PreviewRepeat,
+            CardQueue::Suspended,
+        ] {
+            assert!(
+                Card::convert(card(queue, 30, 7), 10, memory_state()).is_none(),
+                "queue: {queue:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_review_card_uses_original_due() {
+        let card = Card {
+            original_due: 14,
+            original_deck_id: DeckId(1),
+            ..card(CardQueue::Review, 30, 7)
+        };
+
+        let converted = Card::convert(card, 10, memory_state()).unwrap();
+
+        assert_eq!(converted.due, 4.0);
+        assert_eq!(converted.last_date, -3.0);
+    }
+
+    #[test]
+    fn missing_memory_state_falls_back_to_sm2() -> Result<()> {
+        let (mut col, card_id) = collection_with_review_card()?;
+        let req = simulate_request();
+        let fsrs = FSRS::new(Some(&req.params))?;
+        let expected: FsrsMemoryState = fsrs
+            .memory_state_from_sm2(2.5, 10.0, req.historical_retention)?
+            .into();
+
+        let (_, cards) = col.simulate_request_to_config(&req)?;
+
+        let converted = cards.iter().find(|card| card.id == card_id.0).unwrap();
+        assert_eq!(converted.difficulty, expected.difficulty);
+        assert_eq!(converted.stability, expected.stability);
+        Ok(())
+    }
+
+    #[test]
+    fn card_with_invalid_sm2_fallback_is_dropped() -> Result<()> {
+        let (mut col, card_id) = collection_with_review_card()?;
+        let req = SimulateFsrsReviewRequest {
+            historical_retention: 1.0,
+            ..simulate_request()
+        };
+
+        let (_, cards) = col.simulate_request_to_config(&req)?;
+
+        assert!(cards.iter().all(|card| card.id != card_id.0));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_memory_state_populates_desired_retention_and_decay() -> Result<()> {
+        let (mut col, card_id) = collection_with_review_card()?;
+        let req = simulate_request();
+
+        col.simulate_request_to_config(&req)?;
+
+        let card = col.storage.get_card(card_id)?.unwrap();
+        let deck = col.get_deck(DeckId(1))?.unwrap();
+        let deck_config = col.get_deck_config(DeckConfigId(1), false)?.unwrap();
+        assert!(
+            (card.desired_retention.unwrap() - deck.effective_desired_retention(&deck_config))
+                .abs()
+                < 0.001
+        );
+        assert!(
+            (card.decay.unwrap() - get_decay_from_params(deck_config.fsrs_params())).abs() < 0.001
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_learning_step_counts_are_preserved() -> Result<()> {
+        let (mut col, _) = collection_with_review_card()?;
+        let req = SimulateFsrsReviewRequest {
+            learning_step_count: 3,
+            relearning_step_count: 5,
+            ..simulate_request()
+        };
+
+        let (config, _) = col.simulate_request_to_config(&req)?;
+
+        assert_eq!(config.learning_step_count, 3);
+        assert_eq!(config.relearning_step_count, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn new_card_due_offsets_account_for_cards_introduced_today() -> Result<()> {
+        let (mut col, card_id) = collection_with_review_card()?;
+        let mut card = col.storage.get_card(card_id)?.unwrap();
+        card.memory_state = Some(memory_state());
+        col.storage.update_card(&card)?;
+
+        let next_day_at = col.timing_today()?.next_day_at;
+        col.storage.add_revlog_entry(
+            &RevlogEntry {
+                id: RevlogId((next_day_at.0 - 3600) * 1000),
+                cid: card_id,
+                button_chosen: 3,
+                interval: 10,
+                ease_factor: 2500,
+                review_kind: RevlogReviewKind::Review,
+                ..Default::default()
+            },
+            true,
+        )?;
+        let req = SimulateFsrsReviewRequest {
+            deck_size: 2,
+            new_limit: 2,
+            ..simulate_request()
+        };
+
+        let (_, cards) = col.simulate_request_to_config(&req)?;
+        let synthetic_due: Vec<_> = cards
+            .iter()
+            .filter(|card| card.id <= 0)
+            .map(|card| card.due)
+            .collect();
+
+        assert_eq!(synthetic_due, vec![0.0, 1.0]);
+        Ok(())
+    }
+}
